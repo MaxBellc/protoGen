@@ -1,0 +1,6 @@
+{
+  "device_id": 1234,
+  "temp": 25.5,
+  "unit": "Celsius",
+  "__unit_size__": 16
+}
