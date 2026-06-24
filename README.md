@@ -188,6 +188,393 @@ int main(void)
 
 长度向上取 2 的幂：`3→4`, `5→8`, `9→16`, `17→32` ...
 
+---
+
+## 编写协议模板
+
+### 单文件模板
+
+一个 JSON 文件定义一条消息。文件名即为消息名（`SensorData.json` → `SENSOR_DATA`）。
+
+**示例：温湿度传感器上报**
+
+```json
+{
+  "device_id": 1001,
+  "temperature": 25.5,
+  "humidity": 68.2,
+  "location": "living_room",
+  "__location_size__": 32
+}
+```
+
+**示例：设备状态（含嵌套对象）**
+
+```json
+{
+  "device_id": 1,
+  "status": {
+    "power": true,
+    "battery": 85,
+    "signal": -42,
+    "__power_type__": "int8_t"
+  },
+  "timestamp": 1700000000,
+  "__timestamp_type__": "uint32_t"
+}
+```
+
+**示例：GPS 轨迹（含对象数组）**
+
+```json
+{
+  "device_id": 1001,
+  "waypoints": [
+    {"lat": 31.2304, "lon": 121.4737},
+    {"lat": 31.2350, "lon": 121.4800},
+    {"lat": 31.2400, "lon": 121.4850}
+  ]
+}
+```
+
+生成子结构体 `GPS_TRACK_WAYPOINTS`（每个元素的类型），waypoints 字段类型为 `GPS_TRACK_WAYPOINTS waypoints[4]`。数组长度按示例元素数 3 → 向上取 2 的幂 → 4。
+
+序列化和反序列化时自动生成 `for` 循环遍历数组，每个元素调用子结构体的 JSON 构建/解析函数。
+
+### 模板写法规则
+
+| 规则 | 说明 |
+|------|------|
+| 字段值决定类型 | 写 `25.5` → 得到 `float`，写 `1000` → 得到 `int16_t` |
+| 字符串缓冲 | 默认按示例字符串长度向上取 2 的幂。`"hello"` (5 字节) → `uint8_t[8]` |
+| 显式指定大小 | `"__field_size__": 32` → 强制 `uint8_t[32]` |
+| 显式指定类型 | `"__field_type__": "double"` → 覆盖自动推导 |
+| 布尔值 | 写 `true` / `false` → 得到 `int8_t` (0/1) |
+| 数组长度 | 按示例元素数向上取 2 的幂，`"__field_count__": 10` → `[16]` |
+| 元字段命名 | `__` 开头 + `__` 结尾，嵌在数据字段之间 |
+| 隐藏字段 | 不想生成某个字段的代码 → `"__field_hidden__": true` |
+
+### 目录批量定义
+
+将多个 `.json` 文件放入同一目录，一次生成所有消息：
+
+```
+protocols/
+├── SensorData.json          → sensor_data.h / sensor_data.c
+├── DeviceStatus.json        → device_status.h / device_status.c
+└── ControlCommand.json      → control_command.h / control_command.c
+```
+
+```bash
+protogen -i ./protocols/ -o ./generated/
+```
+
+---
+
+## 自动化编译
+
+生成的代码需要链接 cJSON 库。以下是集成到 CMake 项目的完整方案。
+
+### 项目结构（推荐）
+
+```
+my_project/
+├── protocols/                # protoGen 输入的 JSON 模板
+│   ├── SensorData.json
+│   └── DeviceStatus.json
+├── generated/                # protoGen 输出（可加入 .gitignore）
+│   ├── inc/
+│   │   ├── sensor_data.h
+│   │   └── device_status.h
+│   └── src/
+│       ├── sensor_data.c
+│       └── device_status.c
+├── src/                      # 你的业务代码
+│   └── main.c
+├── CMakeLists.txt
+└── Makefile                  # （可选）便捷脚本
+```
+
+### CMakeLists.txt
+
+```cmake
+cmake_minimum_required(VERSION 3.10)
+project(my_project VERSION 1.0.0 LANGUAGES C)
+
+# protoGen 生成目录 + cJSON 头文件路径
+set(GENERATED_DIR ${CMAKE_CURRENT_SOURCE_DIR}/generated)
+set(CJSON_DIR     ${CMAKE_CURRENT_SOURCE_DIR}/../cJSON)
+
+# 可执行文件
+add_executable(my_app
+    src/main.c
+    ${GENERATED_DIR}/src/sensor_data.c
+    ${GENERATED_DIR}/src/device_status.c
+    ${CJSON_DIR}/cJSON.c
+)
+
+target_include_directories(my_app PRIVATE
+    ${GENERATED_DIR}/inc
+    ${CJSON_DIR}
+)
+
+target_compile_options(my_app PRIVATE
+    -Wall -Wextra -Werror
+    -Wdeclaration-after-statement
+    -std=c11
+)
+```
+
+### Makefile（便捷包装）
+
+```makefile
+.PHONY: proto build clean run
+
+# 从 JSON 模板生成 C 代码
+proto:
+	protogen -i ./protocols/ -o ./generated/
+
+# 编译
+build:
+	gcc -std=c11 -Wall -Wextra -Werror \
+	    -I ./generated/inc \
+	    -I ../cJSON \
+	    src/main.c \
+	    generated/src/*.c \
+	    ../cJSON/cJSON.c \
+	    -o build/my_app \
+	    -lm
+
+# 一键：生成 + 编译 + 运行
+all: proto build run
+
+run:
+	./build/my_app
+
+clean:
+	rm -rf build/ generated/
+```
+
+### 编译脚本（纯 shell，无需 Make）
+
+```bash
+#!/bin/bash
+set -e
+
+# 1. 生成 C 代码
+protogen -i ./protocols/ -o ./generated/
+
+# 2. 编译
+gcc -std=c11 -Wall -Wextra -Werror \
+    -I ./generated/inc \
+    -I ../cJSON \
+    src/main.c \
+    generated/src/*.c \
+    ../cJSON/cJSON.c \
+    -o build/my_app \
+    -lm
+
+# 3. 运行
+./build/my_app
+```
+
+### 交叉编译（aarch64 / 嵌入式 Linux）
+
+```bash
+# 先设置交叉编译器路径
+export CC=aarch64-linux-gnu-gcc
+
+# 生成代码（protoGen 本身是 Python，始终在 host 上跑）
+protogen -i ./protocols/ -o ./generated/
+
+# 交叉编译
+${CC} -std=c11 -Wall -Wextra -Werror \
+    -I ./generated/inc \
+    -I ../cJSON \
+    src/main.c \
+    generated/src/*.c \
+    ../cJSON/cJSON.c \
+    -o build/my_app \
+    -lm -static
+```
+
+---
+
+## 完整工作流示例
+
+下面从零开始做一个温湿度传感器上报的完整流程。
+
+### Step 1: 写 JSON 模板
+
+```json
+// protocols/SensorData.json
+{
+  "device_id": 1,
+  "temperature": 25.5,
+  "humidity": 60.0,
+  "location": "room-01",
+  "__location_size__": 32
+}
+```
+
+### Step 2: 生成代码
+
+```bash
+protogen -i protocols/SensorData.json -o generated/
+```
+
+### Step 3: 写业务代码
+
+```c
+// src/main.c
+#include "sensor_data.h"
+#include <stdio.h>
+#include <stdlib.h>
+
+int main(void)
+{
+    /* ---- 序列化 ---- */
+    SENSOR_DATA msg = {0};
+
+    msg.device_id   = 42;
+    msg.temperature = 25.5;
+    msg.humidity    = 68.2;
+    snprintf((char *)msg.location, sizeof(msg.location), "living_room");
+
+    /* 只传温度、湿度和位置，不传 device_id */
+    msg.__mask__ = SENSOR_DATA_MASK(SENSOR_DATA_FIELD_TEMPERATURE)
+                 | SENSOR_DATA_MASK(SENSOR_DATA_FIELD_HUMIDITY)
+                 | SENSOR_DATA_MASK(SENSOR_DATA_FIELD_LOCATION);
+
+    char *json_str = NULL;
+    sensor_data_serialize(&msg, &json_str);
+    printf("序列化: %s\n", json_str);
+    /* 输出: {"temperature":25.5,"humidity":68.2,"location":"living_room"} */
+
+    /* ---- 反序列化 ---- */
+    SENSOR_DATA rx = {0};
+    sensor_data_deserialize(&rx, json_str);
+
+    if (sensor_data_has_temperature(&rx))
+    {
+        printf("温度 = %.1f\n", rx.temperature);
+    }
+    if (sensor_data_has_device_id(&rx))
+    {
+        printf("设备ID = %d\n", rx.device_id);
+    }
+    else
+    {
+        printf("设备ID 未传输\n");
+    }
+
+    cJSON_free(json_str);
+    return 0;
+}
+```
+
+### Step 4: 编译运行
+
+```bash
+gcc -std=c11 -Wall -Wextra -Werror \
+    -I generated/inc -I ../cJSON \
+    src/main.c generated/src/sensor_data.c ../cJSON/cJSON.c \
+    -o build/sensor_demo -lm
+
+./build/sensor_demo
+```
+
+### 在 MQTT 场景中使用
+
+```c
+#include "mqtt_client.h"
+#include "sensor_data.h"
+
+void publish_sensor(MQTT_CLIENT *client)
+{
+    SENSOR_DATA msg = {0};
+    char       *json_str = NULL;
+
+    /* 读取传感器数据 */
+    msg.device_id   = get_device_id();
+    msg.temperature = read_temperature();
+    msg.humidity    = read_humidity();
+    msg.__mask__    = SENSOR_DATA_MASK(SENSOR_DATA_FIELD_DEVICE_ID)
+                    | SENSOR_DATA_MASK(SENSOR_DATA_FIELD_TEMPERATURE)
+                    | SENSOR_DATA_MASK(SENSOR_DATA_FIELD_HUMIDITY);
+
+    /* 序列化 + 发布 */
+    sensor_data_serialize(&msg, &json_str);
+
+    /* 构造 cJSON 对象用于 mqttClient API */
+    cJSON *payload = cJSON_Parse(json_str);
+    mqtt_client_publish(client, "sensor/data", payload, 1, 0);
+
+    cJSON_Delete(payload);
+    cJSON_free(json_str);
+}
+```
+
+### 对象数组的使用
+
+```c
+#include "gps_track.h"
+
+void send_gps_track(MQTT_CLIENT *client)
+{
+    GPS_TRACK msg = {0};
+    char     *json_str = NULL;
+
+    /* 填充第一条轨迹点 */
+    msg.waypoints[0].lat = 31.2304;
+    msg.waypoints[0].lon = 121.4737;
+    msg.waypoints[0].__mask__ = GPS_TRACK_WAYPOINTS_MASK(
+                                    GPS_TRACK_WAYPOINTS_FIELD_LAT)
+                              | GPS_TRACK_WAYPOINTS_MASK(
+                                    GPS_TRACK_WAYPOINTS_FIELD_LON);
+
+    /* 填充第二条轨迹点 */
+    msg.waypoints[1].lat = 31.2350;
+    msg.waypoints[1].lon = 121.4800;
+    msg.waypoints[1].__mask__ = GPS_TRACK_WAYPOINTS_MASK(
+                                    GPS_TRACK_WAYPOINTS_FIELD_LAT)
+                              | GPS_TRACK_WAYPOINTS_MASK(
+                                    GPS_TRACK_WAYPOINTS_FIELD_LON);
+
+    /* 只传 waypoints，不传 device_id */
+    msg.__mask__ = GPS_TRACK_MASK(GPS_TRACK_FIELD_WAYPOINTS);
+
+    /* 序列化 → 发布 */
+    gps_track_serialize(&msg, &json_str);
+    /* {"waypoints":[{"lat":31.2304,"lon":121.4737},{"lat":31.235,"lon":121.48}]} */
+
+    cJSON *payload = cJSON_Parse(json_str);
+    mqtt_client_publish(client, "gps/track", payload, 1, 0);
+
+    cJSON_Delete(payload);
+    cJSON_free(json_str);
+}
+```
+
+### 反序列化对象数组
+
+```c
+GPS_TRACK rx = {0};
+gps_track_deserialize(&rx, json_str);
+
+/* 遍历已传输的轨迹点 */
+for (int32_t i = 0; i < 4; i++)
+{
+    if (gps_track_has_waypoints(&rx))
+    {
+        printf("waypoint[%d]: lat=%.4f lon=%.4f\n",
+               i, rx.waypoints[i].lat, rx.waypoints[i].lon);
+    }
+}
+```
+
+---
+
 ## CLI
 
 ```bash
